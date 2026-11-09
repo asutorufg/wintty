@@ -1,0 +1,160 @@
+# Community Windows x64 portable builds for asutorufg/wintty.
+# Pull requests build and upload an Actions artifact. Pushes to windows and
+# manual runs publish a snapshot pre-release; v* tags publish normal releases.
+name: Windows portable release
+
+on:
+  pull_request:
+    branches: [windows]
+  push:
+    branches: [windows]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-portable-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - name: Checkout (including version history)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        # Version is read from .minimum_zig_version in build.zig.zon.
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        # SDK version is read from the repository's global.json.
+
+      - name: Build optimized libghostty for portable x64 CPUs
+        shell: pwsh
+        run: |
+          zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path 'zig-out/lib/ghostty-static.lib')) {
+            throw 'Missing ghostty-static.lib: cannot link the NativeAOT executable.'
+          }
+          if (-not (Test-Path 'zig-out/lib/ghostty.dll')) {
+            throw 'Missing ghostty.dll: the managed build and resource guards require it.'
+          }
+
+      - name: Build Release WinUI application
+        shell: pwsh
+        run: |
+          dotnet build windows/Ghostty.sln -c Release /p:Platform=x64 /p:RestoreLockedMode=true
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Publish self-contained NativeAOT executable
+        shell: pwsh
+        run: |
+          dotnet publish windows/Ghostty/Ghostty.csproj -c Release -r win-x64 /p:Platform=x64 --no-restore
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify and package portable app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $publishDir = 'windows/Ghostty/bin/x64/Release/net10.0-windows10.0.19041.0/win-x64/publish'
+          if (-not (Test-Path -LiteralPath $publishDir -PathType Container)) {
+            throw "NativeAOT publish directory not found: $publishDir"
+          }
+          # A Wintty installation is more than its main executable.
+          # These dependencies also defend against silently broken graphics,
+          # notifications, ConPTY and shell integration.
+          $required = @(
+            'Wintty.exe',
+            'conpty.dll',
+            'OpenConsole.exe',
+            'dxcompiler.dll',
+            'Microsoft.WindowsAppRuntime.Insights.Resource.dll',
+            'share/terminfo/ghostty.terminfo',
+            'share/ghostty/shell-integration/powershell/ghostty.ps1'
+          )
+          foreach ($relative in $required) {
+            $file = Join-Path $publishDir $relative
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+              throw "Required release file missing: $file"
+            }
+          }
+
+          New-Item -ItemType Directory -Force -Path 'release' | Out-Null
+          $archive = 'release/Wintty-win-x64.zip'
+          Compress-Archive -Path (Join-Path $publishDir '*') -DestinationPath $archive -CompressionLevel Optimal -Force
+          if ((Get-Item -LiteralPath $archive).Length -eq 0) { throw 'The archive is empty.' }
+          $sha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$sha256  Wintty-win-x64.zip" | Set-Content -LiteralPath 'release/Wintty-win-x64.sha256' -Encoding ascii
+
+      - name: Upload Actions artifact (including PR builds)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Wintty-win-x64
+          path: release/Wintty-win-x64.*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    # A PR must never be allowed to publish with a write token.
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: Wintty-win-x64
+          path: release-assets
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          test -s release-assets/Wintty-win-x64.zip
+          test -s release-assets/Wintty-win-x64.sha256
+          (cd release-assets && sha256sum -c Wintty-win-x64.sha256)
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            release_tag="${GITHUB_REF#refs/tags/}"
+            release_title="Wintty ${release_tag} (Windows x64)"
+            release_flags=()
+          else
+            release_tag="snapshot-${GITHUB_SHA:0:12}"
+            release_title="Wintty snapshot ${GITHUB_SHA:0:12} (Windows x64)"
+            release_flags=(--prerelease --latest=false)
+          fi
+
+          cat > release-notes.md <<EOF
+          Community-built, **unsigned** Windows x64 portable edition of Wintty.
+
+          - Commit: `$GITHUB_SHA`
+          - Requires Windows 11 and a DirectX 12 feature-level 12.0 GPU.
+          - Extract the ZIP and run `Wintty.exe`. Keep the included DLLs and directories next to it.
+          - Not an official upstream installer. No code signing or automatic updater is included.
+          - Verify the download against `Wintty-win-x64.sha256`.
+          EOF
+
+          if gh release view "$release_tag" >/dev/null 2>&1; then
+            gh release upload "$release_tag" release-assets/Wintty-win-x64.zip release-assets/Wintty-win-x64.sha256 --clobber
+          else
+            gh release create "$release_tag" \
+              release-assets/Wintty-win-x64.zip release-assets/Wintty-win-x64.sha256 \
+              --target "$GITHUB_SHA" \
+              --title "$release_title" \
+              --notes-file release-notes.md \
+              "${release_flags[@]}"
+          fi
